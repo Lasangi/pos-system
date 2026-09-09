@@ -1,0 +1,27 @@
+# Node modules
+node_modules/
+
+# Environment variables and secrets
+.env
+.env.*
+
+# Build outputs
+/dist/
+build/
+dist/
+
+# Temporary database and backup artifacts
+*.sql
+*.dump
+*.bak
+*.backup
+database_backup*.json
+
+# Logs
+*.log
+
+# OS/editor artifacts
+.DS_Store
+Thumbs.db
+
+# Keep source files tracked; do not add broad ignores for project code
