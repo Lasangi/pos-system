@@ -184,6 +184,15 @@ The application exposes the following main backend routes.
 ### Dashboard
 - GET /api/dashboard
 
+## Authentication and Access
+The application uses a session-based login flow with role-based access. Users authenticate through the backend before they can access the main POS workflow.
+
+- Admin users can access the full application, including User Management.
+- Cashier users can access standard POS functions but are blocked from admin-only APIs.
+- Inactive accounts cannot sign in.
+- Passwords are hashed on the backend and are never returned to the frontend.
+- Authentication state is kept in server-side sessions rather than localStorage.
+
 ## Usage
 A typical workflow is:
 

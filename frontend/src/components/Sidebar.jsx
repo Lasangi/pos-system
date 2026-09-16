@@ -1,40 +1,37 @@
-function Sidebar({ currentPage, setCurrentPage }) {
+function Sidebar({ currentPage, setCurrentPage, user }) {
+  const navItems = [
+    { key: "dashboard", label: "Dashboard" },
+    { key: "pos", label: "POS" },
+    { key: "products", label: "Products" },
+    { key: "inventory", label: "Inventory" },
+    { key: "sales", label: "Sales" },
+    { key: "customers", label: "Customers" },
+    { key: "reports", label: "Reports" },
+    { key: "settings", label: "Settings" },
+    { key: "users", label: "User Management" },
+  ];
+
+  const visibleNavItems = user?.role === "admin"
+    ? navItems
+    : navItems.filter((item) => item.key !== "settings" && item.key !== "users");
+
   return (
     <aside className="sidebar">
       <h2>MY POS</h2>
+      <div className="sidebar-user-badge">{user?.role === "admin" ? "Admin Access" : "Cashier Access"}</div>
 
       <nav>
-        <button onClick={() => setCurrentPage("dashboard")}>
-          Dashboard
-        </button>
-
-        <button onClick={() => setCurrentPage("pos")}>
-          POS
-        </button>
-
-        <button onClick={() => setCurrentPage("products")}>
-          Products
-        </button>
-
-        <button onClick={() => setCurrentPage("inventory")}>
-          Inventory
-        </button>
-
-        <button onClick={() => setCurrentPage("sales")}>
-          Sales
-        </button>
-
-        <button onClick={() => setCurrentPage("customers")}>
-          Customers
-        </button>
-
-        <button onClick={() => setCurrentPage("reports")}>
-          Reports
-        </button>
-
-        <button onClick={() => setCurrentPage("settings")}>
-          Settings
-        </button>
+        {visibleNavItems.map((item) => (
+          <button
+            key={item.key}
+            type="button"
+            className={`nav-button ${currentPage === item.key ? "active" : ""}`}
+            onClick={() => setCurrentPage(item.key)}
+            aria-current={currentPage === item.key ? "page" : undefined}
+          >
+            {item.label}
+          </button>
+        ))}
       </nav>
     </aside>
   );

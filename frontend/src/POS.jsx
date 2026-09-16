@@ -19,7 +19,7 @@ function formatCurrency(value, currency = "LKR") {
   return `${currency} ${formatter.format(amount)}`;
 }
 
-function POS() {
+function POS({ user }) {
   const [products, setProducts] = useState([]);
   const [cart, setCart] = useState([]);
   const [customers, setCustomers] = useState([]);
@@ -76,6 +76,10 @@ function POS() {
         )
         .filter((item) => item.quantity > 0)
     );
+  }
+
+  function removeItem(id) {
+    setCart((currentCart) => currentCart.filter((item) => item.id !== id));
   }
 
   const subtotal = cart.reduce(
@@ -154,6 +158,7 @@ function POS() {
       customer_id: selectedCustomerId || null,
       discount: discValue,
       tax_rate: settings.taxEnabled ? taxValue : 0,
+      user_id: user?.id || null,
     };
 
     try {
@@ -241,27 +246,38 @@ function POS() {
           <h3>Cart</h3>
 
           {cart.length === 0 ? (
-            <p>Your cart is empty.</p>
+            <div className="empty-state compact-state">
+              <p>Your cart is empty.</p>
+            </div>
           ) : (
             cart.map((item) => (
               <div className="cart-item" key={item.id}>
-                <div>
+                <div className="cart-item-main">
                   <strong>{item.name}</strong>
                   <p>
                     {formatCurrency(item.price, settings.currency)} × {item.quantity}
                   </p>
                 </div>
 
-                <div className="quantity-controls">
-                  <button onClick={() => decreaseQuantity(item.id)}>−</button>
-                  <span>{item.quantity}</span>
-                  <button onClick={() => increaseQuantity(item.id)}>+</button>
+                <div className="cart-item-actions">
+                  <div className="quantity-controls">
+                    <button type="button" onClick={() => decreaseQuantity(item.id)} aria-label={`Decrease quantity for ${item.name}`}>
+                      −
+                    </button>
+                    <span>{item.quantity}</span>
+                    <button type="button" onClick={() => increaseQuantity(item.id)} aria-label={`Increase quantity for ${item.name}`}>
+                      +
+                    </button>
+                  </div>
+                  <button type="button" className="remove-item-btn" onClick={() => removeItem(item.id)}>
+                    Remove
+                  </button>
                 </div>
               </div>
             ))
           )}
 
-          <hr />
+          <div className="cart-divider" />
 
           <div className="cart-total">
             <strong>Total:</strong>

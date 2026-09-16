@@ -1,25 +1,76 @@
 const express = require("express");
 const mysql = require("mysql2");
 const cors = require("cors");
+const bcrypt = require("bcryptjs");
+const session = require("express-session");
 require("dotenv").config();
 
 const app = express();
 
-app.use(cors());
+app.use(cors({
+  origin: true,
+  credentials: true
+}));
 app.use(express.json());
+app.use(session({
+  secret: process.env.SESSION_SECRET || "pos-system-dev-secret",
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: false,
+    maxAge: 1000 * 60 * 60 * 12
+  }
+}));
 
 const PORT = 5000;
 
-const db = mysql.createConnection({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  port: process.env.DB_PORT
-});
+let isReconnecting = false;
+
+function createDbConnection() {
+  const connection = mysql.createConnection({
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    port: process.env.DB_PORT
+  });
+
+  connection.on('error', (error) => {
+    if (error && (error.code === 'PROTOCOL_CONNECTION_LOST' || error.fatal)) {
+      if (isReconnecting) return;
+      isReconnecting = true;
+      console.error('Database connection lost. Reconnecting to MySQL...');
+      setTimeout(() => {
+        if (db && db.state !== 'disconnected') {
+          db.destroy();
+        }
+
+        db = createDbConnection();
+        db.connect((connectError) => {
+          isReconnecting = false;
+          if (connectError) {
+            console.error('MySQL reconnect failed:', connectError.message);
+            return;
+          }
+
+          console.log('MySQL reconnected successfully!');
+          initializeDatabaseSchema();
+        });
+      }, 1000);
+      return;
+    }
+
+    console.error('Unhandled MySQL error:', error.message);
+  });
+
+  return connection;
+}
+
+let db = createDbConnection();
 
 function initializeDatabaseSchema() {
-  // Ensure customers table exists for Customer Management feature.
   const createCustomersTable = `
     CREATE TABLE IF NOT EXISTS customers (
       id INT PRIMARY KEY AUTO_INCREMENT,
@@ -49,6 +100,64 @@ function initializeDatabaseSchema() {
         console.error('Error ensuring customers.notes column exists:', addNotesErr.message);
       }
     });
+  });
+
+  const createUsersTable = `
+    CREATE TABLE IF NOT EXISTS users (
+      id INT PRIMARY KEY AUTO_INCREMENT,
+      full_name VARCHAR(100) NOT NULL,
+      username VARCHAR(50) NOT NULL UNIQUE,
+      email VARCHAR(150) NULL UNIQUE,
+      password_hash VARCHAR(255) NOT NULL,
+      role ENUM('admin', 'cashier') NOT NULL DEFAULT 'cashier',
+      is_active TINYINT(1) NOT NULL DEFAULT 1,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP(),
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `;
+
+  db.query(createUsersTable, (userTableErr) => {
+    if (userTableErr) {
+      console.error('Error ensuring users table exists:', userTableErr.message);
+      return;
+    }
+
+    db.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name VARCHAR(100)", (addNameErr) => {
+      if (addNameErr) {
+        console.error('Error ensuring users.full_name column exists:', addNameErr.message);
+      }
+    });
+    db.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(50)", (addUserErr) => {
+      if (addUserErr) {
+        console.error('Error ensuring users.username column exists:', addUserErr.message);
+      }
+    });
+    db.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(150)", (addEmailErr) => {
+      if (addEmailErr) {
+        console.error('Error ensuring users.email column exists:', addEmailErr.message);
+      }
+    });
+    db.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255)", (addHashErr) => {
+      if (addHashErr) {
+        console.error('Error ensuring users.password_hash column exists:', addHashErr.message);
+      }
+    });
+    db.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS role ENUM('admin', 'cashier') NOT NULL DEFAULT 'cashier'", (addRoleErr) => {
+      if (addRoleErr) {
+        console.error('Error ensuring users.role column exists:', addRoleErr.message);
+      }
+    });
+    db.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active TINYINT(1) NOT NULL DEFAULT 1", (addActiveErr) => {
+      if (addActiveErr) {
+        console.error('Error ensuring users.is_active column exists:', addActiveErr.message);
+      }
+    });
+  });
+
+  db.query("ALTER TABLE sales ADD COLUMN IF NOT EXISTS user_id INT NULL", (saleUserErr) => {
+    if (saleUserErr) {
+      console.error('Error ensuring sales.user_id column exists:', saleUserErr.message);
+    }
   });
 
   const createSettingsTable = `
@@ -117,25 +226,6 @@ db.connect((error) => {
   initializeDatabaseSchema();
 });
 
-db.on('error', (error) => {
-  if (error && (error.code === 'PROTOCOL_CONNECTION_LOST' || error.fatal)) {
-    console.error('Database connection lost. Reconnecting to MySQL...');
-    setTimeout(() => {
-      db.connect((connectError) => {
-        if (connectError) {
-          console.error('MySQL reconnect failed:', connectError.message);
-          return;
-        }
-
-        console.log('MySQL reconnected successfully!');
-        initializeDatabaseSchema();
-      });
-    }, 1000);
-  } else {
-    console.error('Unhandled MySQL error:', error.message);
-  }
-});
-
 const defaultSettings = {
   storeName: 'My POS Store',
   storeAddress: '',
@@ -166,6 +256,107 @@ function parseBoolean(value) {
 function toSafeNumber(value, fallback = 0) {
   const num = Number(value);
   return Number.isFinite(num) ? num : fallback;
+}
+
+function getSessionUser(req) {
+  return req.session && req.session.user ? req.session.user : null;
+}
+
+function requireAuth(req, res, next) {
+  const user = getSessionUser(req);
+  if (!user) {
+    return res.status(401).json({ error: 'Authentication required.' });
+  }
+
+  if (!user.is_active) {
+    req.session.destroy(() => {});
+    return res.status(403).json({ error: 'Your account is inactive.' });
+  }
+
+  req.user = user;
+  next();
+}
+
+function requireAdmin(req, res, next) {
+  const user = getSessionUser(req);
+  if (!user || user.role !== 'admin') {
+    return res.status(403).json({ error: 'Admin access required.' });
+  }
+
+  if (!user.is_active) {
+    req.session.destroy(() => {});
+    return res.status(403).json({ error: 'Your account is inactive.' });
+  }
+
+  req.user = user;
+  next();
+}
+
+function buildSafeUser(row) {
+  if (!row) return null;
+  return {
+    id: Number(row.id),
+    full_name: row.full_name || row.username || 'User',
+    username: row.username,
+    email: row.email || null,
+    role: row.role || 'cashier',
+    is_active: Boolean(Number(row.is_active ?? 1)),
+    created_at: row.created_at || null,
+  };
+}
+
+function getUserStatusBoolean(value, fallback = true) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  }
+  if (value === 0 || value === '0') return false;
+  return Boolean(value ?? fallback);
+}
+
+function normalizeUserEmail(value) {
+  const email = typeof value === 'string' ? value.trim() : '';
+  if (!email) return null;
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    throw new Error('Please enter a valid email address.');
+  }
+  return email;
+}
+
+function normalizeUserPayload(input = {}, { requirePassword = false } = {}) {
+  const fullName = String(input.full_name ?? input.fullName ?? '').trim();
+  const username = String(input.username ?? '').trim();
+  const email = normalizeUserEmail(input.email ?? '');
+  const role = String(input.role ?? 'cashier');
+  const password = typeof input.password === 'string' ? input.password : '';
+  const isActive = getUserStatusBoolean(input.is_active ?? input.isActive ?? true, true);
+
+  if (!fullName) {
+    throw new Error('Full name is required.');
+  }
+
+  if (!username) {
+    throw new Error('Username is required.');
+  }
+
+  if (!['admin', 'cashier'].includes(role)) {
+    throw new Error('Role must be admin or cashier.');
+  }
+
+  if (requirePassword && !password) {
+    throw new Error('Password is required.');
+  }
+
+  return {
+    fullName,
+    username,
+    email,
+    role,
+    password,
+    isActive,
+  };
 }
 
 function normalizeSettings(payload = {}) {
@@ -230,6 +421,348 @@ function getSettingsObject(rows = []) {
 
   return loaded;
 }
+
+app.get('/api/auth/setup-status', (req, res) => {
+  db.query('SELECT COUNT(*) AS total FROM users', (err, rows) => {
+    if (err) {
+      console.error('Error checking auth setup status:', err.message);
+      return res.status(500).json({ error: 'Failed to check auth setup status' });
+    }
+
+    const hasUsers = Number(rows[0]?.total || 0) > 0;
+    res.json({ hasUsers, requireFirstAdmin: !hasUsers });
+  });
+});
+
+app.get('/api/auth/session', (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) {
+    return res.json({ authenticated: false, user: null });
+  }
+
+  db.query('SELECT id, full_name, username, email, role, is_active FROM users WHERE id = ? LIMIT 1', [user.id], (err, rows) => {
+    if (err) {
+      console.error('Error validating session user:', err.message);
+      return res.status(500).json({ error: 'Failed to validate session' });
+    }
+
+    if (!rows.length) {
+      req.session.destroy(() => {});
+      return res.json({ authenticated: false, user: null });
+    }
+
+    const activeUser = buildSafeUser(rows[0]);
+    if (!activeUser || !activeUser.is_active) {
+      req.session.destroy(() => {});
+      return res.json({ authenticated: false, user: null });
+    }
+
+    req.session.user = activeUser;
+    return res.json({ authenticated: true, user: activeUser });
+  });
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  req.session.destroy((err) => {
+    if (err) {
+      console.error('Error logging out:', err.message);
+      return res.status(500).json({ error: 'Failed to log out' });
+    }
+
+    res.json({ success: true });
+  });
+});
+
+app.post('/api/auth/login', (req, res) => {
+  const username = String(req.body?.username || '').trim();
+  const password = String(req.body?.password || '');
+
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password are required.' });
+  }
+
+  db.query('SELECT * FROM users WHERE username = ? LIMIT 1', [username], (err, rows) => {
+    if (err) {
+      console.error('Error fetching user for login:', err.message);
+      return res.status(500).json({ error: 'Failed to log in' });
+    }
+
+    if (rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid username or password.' });
+    }
+
+    const userRow = rows[0];
+    if (!userRow.is_active) {
+      return res.status(403).json({ error: 'This account is inactive.' });
+    }
+
+    const passwordMatches = bcrypt.compareSync(password, userRow.password_hash || '');
+    if (!passwordMatches) {
+      return res.status(401).json({ error: 'Invalid username or password.' });
+    }
+
+    const user = buildSafeUser(userRow);
+    req.session.user = user;
+    res.json({ authenticated: true, user });
+  });
+});
+
+app.post('/api/auth/first-admin', (req, res) => {
+  const fullName = String(req.body?.full_name || '').trim();
+  const username = String(req.body?.username || '').trim();
+  const password = String(req.body?.password || '');
+
+  if (!fullName || !username || !password) {
+    return res.status(400).json({ error: 'Full name, username, and password are required.' });
+  }
+
+  db.query('SELECT COUNT(*) AS total FROM users', (countErr, rows) => {
+    if (countErr) {
+      console.error('Error checking users before first admin creation:', countErr.message);
+      return res.status(500).json({ error: 'Failed to initialize admin account' });
+    }
+
+    if (Number(rows[0]?.total || 0) > 0) {
+      return res.status(409).json({ error: 'An admin account already exists.' });
+    }
+
+    const passwordHash = bcrypt.hashSync(password, 12);
+    db.query('INSERT INTO users (full_name, username, email, password_hash, role, is_active) VALUES (?, ?, ?, ?, ?, ?)',
+      [fullName, username, req.body?.email || null, passwordHash, 'admin', 1],
+      (insertErr, result) => {
+        if (insertErr) {
+          console.error('Error creating first admin user:', insertErr.message);
+          if (insertErr.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({ error: 'That username or email is already in use.' });
+          }
+          return res.status(500).json({ error: 'Failed to create admin account' });
+        }
+
+        db.query('SELECT id, full_name, username, email, role, is_active, created_at FROM users WHERE id = ?', [result.insertId], (selectErr, userRows) => {
+          if (selectErr) {
+            console.error('Error fetching new admin user:', selectErr.message);
+            return res.status(500).json({ error: 'Admin account created but details could not be loaded' });
+          }
+
+          const user = buildSafeUser(userRows[0]);
+          req.session.user = user;
+          res.status(201).json({ success: true, user });
+        });
+      }
+    );
+  });
+});
+
+app.get('/api/auth/users', requireAdmin, (req, res) => {
+  db.query('SELECT id, full_name, username, email, role, is_active, created_at FROM users ORDER BY created_at DESC', (err, rows) => {
+    if (err) {
+      console.error('Error fetching users:', err.message);
+      return res.status(500).json({ error: 'Failed to fetch users' });
+    }
+
+    res.json((rows || []).map((row) => buildSafeUser(row)));
+  });
+});
+
+app.post('/api/auth/users', requireAdmin, (req, res) => {
+  try {
+    const payload = normalizeUserPayload(req.body, { requirePassword: true });
+    const passwordHash = bcrypt.hashSync(payload.password, 12);
+
+    db.query('INSERT INTO users (full_name, username, email, password_hash, role, is_active) VALUES (?, ?, ?, ?, ?, ?)',
+      [payload.fullName, payload.username, payload.email, passwordHash, payload.role, payload.isActive ? 1 : 0],
+      (insertErr, result) => {
+        if (insertErr) {
+          console.error('Error creating user:', insertErr.message);
+          if (insertErr.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({ error: 'That username or email is already in use.' });
+          }
+          return res.status(500).json({ error: 'Failed to create user' });
+        }
+
+        db.query('SELECT id, full_name, username, email, role, is_active, created_at FROM users WHERE id = ?', [result.insertId], (selectErr, userRows) => {
+          if (selectErr) {
+            console.error('Error fetching created user:', selectErr.message);
+            return res.status(500).json({ error: 'User created but details could not be loaded' });
+          }
+
+          res.status(201).json(buildSafeUser(userRows[0]));
+        });
+      }
+    );
+  } catch (error) {
+    return res.status(400).json({ error: error.message || 'Invalid user data.' });
+  }
+});
+
+app.put('/api/auth/users/:id', requireAuth, requireAdmin, (req, res) => {
+  const userId = Number(req.params.id);
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return res.status(400).json({ error: 'Invalid user id.' });
+  }
+
+  try {
+    const payload = normalizeUserPayload(req.body, { requirePassword: false });
+
+    db.query('SELECT id, full_name, username, email, role, is_active FROM users WHERE id = ? LIMIT 1', [userId], (fetchErr, rows) => {
+      if (fetchErr) {
+        console.error('Error loading user for update:', fetchErr.message);
+        return res.status(500).json({ error: 'Failed to load user' });
+      }
+
+      if (!rows.length) {
+        return res.status(404).json({ error: 'User not found.' });
+      }
+
+      const existingUser = rows[0];
+      const nextRole = payload.role || existingUser.role;
+      const nextActive = payload.isActive ?? Boolean(Number(existingUser.is_active ?? 1));
+      const adminIsAtRisk = existingUser.role === 'admin' && Number(existingUser.is_active ?? 1) === 1 && (nextRole !== 'admin' || !nextActive);
+
+      if (adminIsAtRisk) {
+        db.query('SELECT COUNT(*) AS total FROM users WHERE role = ? AND is_active = 1 AND id != ?', ['admin', userId], (countErr, adminRows) => {
+          if (countErr) {
+            console.error('Error checking remaining admins:', countErr.message);
+            return res.status(500).json({ error: 'Unable to validate admin protection rules.' });
+          }
+
+          if (Number(adminRows[0]?.total || 0) === 0) {
+            return res.status(400).json({
+              error: 'This is the only active admin account. It cannot be demoted or deactivated.'
+            });
+          }
+
+          updateUserRecord();
+        });
+        return;
+      }
+
+      updateUserRecord();
+
+      function updateUserRecord() {
+        db.query(
+          'UPDATE users SET full_name = ?, username = ?, email = ?, role = ?, is_active = ? WHERE id = ?',
+          [payload.fullName, payload.username, payload.email, nextRole, nextActive ? 1 : 0, userId],
+          (updateErr) => {
+            if (updateErr) {
+              console.error('Error updating user:', updateErr.message);
+              if (updateErr.code === 'ER_DUP_ENTRY') {
+                return res.status(409).json({ error: 'That username or email is already in use.' });
+              }
+              return res.status(500).json({ error: 'Failed to update user' });
+            }
+
+            db.query('SELECT id, full_name, username, email, role, is_active, created_at FROM users WHERE id = ? LIMIT 1', [userId], (selectErr, updatedRows) => {
+              if (selectErr) {
+                console.error('Error fetching updated user:', selectErr.message);
+                return res.status(500).json({ error: 'User updated but details could not be loaded' });
+              }
+
+              res.json(buildSafeUser(updatedRows[0]));
+            });
+          }
+        );
+      }
+    });
+  } catch (error) {
+    return res.status(400).json({ error: error.message || 'Invalid user data.' });
+  }
+});
+
+app.put('/api/auth/users/:id/password', requireAuth, requireAdmin, (req, res) => {
+  const userId = Number(req.params.id);
+  const newPassword = String(req.body?.password || '');
+
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return res.status(400).json({ error: 'Invalid user id.' });
+  }
+
+  if (!newPassword || newPassword.length < 6) {
+    return res.status(400).json({ error: 'Password must be at least 6 characters long.' });
+  }
+
+  db.query('SELECT id, role, is_active FROM users WHERE id = ? LIMIT 1', [userId], (fetchErr, rows) => {
+    if (fetchErr) {
+      console.error('Error loading user for password change:', fetchErr.message);
+      return res.status(500).json({ error: 'Failed to load user' });
+    }
+
+    if (!rows.length) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+
+    const passwordHash = bcrypt.hashSync(newPassword, 12);
+    db.query('UPDATE users SET password_hash = ? WHERE id = ?', [passwordHash, userId], (updateErr) => {
+      if (updateErr) {
+        console.error('Error updating user password:', updateErr.message);
+        return res.status(500).json({ error: 'Failed to update password' });
+      }
+
+      res.json({ success: true });
+    });
+  });
+});
+
+app.put('/api/auth/users/:id/status', requireAuth, requireAdmin, (req, res) => {
+  const userId = Number(req.params.id);
+  const nextActive = getUserStatusBoolean(req.body?.is_active ?? req.body?.isActive ?? true, true);
+
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return res.status(400).json({ error: 'Invalid user id.' });
+  }
+
+  db.query('SELECT id, role, is_active FROM users WHERE id = ? LIMIT 1', [userId], (fetchErr, rows) => {
+    if (fetchErr) {
+      console.error('Error loading user for status change:', fetchErr.message);
+      return res.status(500).json({ error: 'Failed to load user' });
+    }
+
+    if (!rows.length) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+
+    const existingUser = rows[0];
+    const statusWillDisableLastAdmin = existingUser.role === 'admin' && Number(existingUser.is_active ?? 1) === 1 && !nextActive;
+
+    if (statusWillDisableLastAdmin) {
+      db.query('SELECT COUNT(*) AS total FROM users WHERE role = ? AND is_active = 1 AND id != ?', ['admin', userId], (countErr, adminRows) => {
+        if (countErr) {
+          console.error('Error checking remaining admins:', countErr.message);
+          return res.status(500).json({ error: 'Unable to validate admin protection rules.' });
+        }
+
+        if (Number(adminRows[0]?.total || 0) === 0) {
+          return res.status(400).json({
+            error: 'This is the only active admin account. It cannot be deactivated.'
+          });
+        }
+
+        updateUserStatus();
+      });
+      return;
+    }
+
+    updateUserStatus();
+
+    function updateUserStatus() {
+      db.query('UPDATE users SET is_active = ? WHERE id = ?', [nextActive ? 1 : 0, userId], (updateErr) => {
+        if (updateErr) {
+          console.error('Error updating user status:', updateErr.message);
+          return res.status(500).json({ error: 'Failed to update user status' });
+        }
+
+        db.query('SELECT id, full_name, username, email, role, is_active, created_at FROM users WHERE id = ? LIMIT 1', [userId], (selectErr, userRows) => {
+          if (selectErr) {
+            console.error('Error fetching updated user status:', selectErr.message);
+            return res.status(500).json({ error: 'User status updated but details could not be loaded' });
+          }
+
+          res.json(buildSafeUser(userRows[0]));
+        });
+      });
+    }
+  });
+});
 
 // Minimal early customers GET to ensure route is available before other middleware
 app.get("/api/customers", (req, res) => {
@@ -346,7 +879,9 @@ app.post("/api/products", (req, res) => {
 
 // Checkout endpoint: create sale, sale_items, decrease stock in a transaction
 app.post("/api/checkout", (req, res) => {
-  const { cart, payment_method, customer_id, discount = 0, tax_rate = 0 } = req.body;
+  const { cart, payment_method, customer_id, discount = 0, tax_rate = 0, user_id } = req.body;
+  const sessionUser = getSessionUser(req);
+  const effectiveUserId = Number.isInteger(Number(user_id)) ? Number(user_id) : (sessionUser ? Number(sessionUser.id) : null);
 
   if (!cart || !Array.isArray(cart) || cart.length === 0) {
     return res.status(400).json({ error: "Cart is empty" });
@@ -439,8 +974,8 @@ app.post("/api/checkout", (req, res) => {
       }
 
       function insertSaleWithCustomer(custId) {
-        const insertSaleSql = `INSERT INTO sales (total, payment_method, customer_id) VALUES (?, ?, ?)`;
-        db.query(insertSaleSql, [finalTotal, payment_method, custId], (err, saleResult) => {
+        const insertSaleSql = `INSERT INTO sales (total, payment_method, customer_id, user_id) VALUES (?, ?, ?, ?)`;
+        db.query(insertSaleSql, [finalTotal, payment_method, custId, effectiveUserId], (err, saleResult) => {
           if (err) {
             console.error("Error inserting sale:", err.message);
             return db.rollback(() => res.status(500).json({ error: "Failed to create sale" }));
@@ -526,9 +1061,12 @@ app.post("/api/checkout", (req, res) => {
 app.get("/api/sales", (req, res) => {
   const sql = `
     SELECT s.id, s.total, s.payment_method, s.customer_id,
-      COALESCE(c.name, 'Walk-in Customer') AS customer_name, s.created_at
+      COALESCE(c.name, 'Walk-in Customer') AS customer_name,
+      COALESCE(u.full_name, 'System') AS cashier_name,
+      s.created_at
     FROM sales s
     LEFT JOIN customers c ON s.customer_id = c.id
+    LEFT JOIN users u ON s.user_id = u.id
     ORDER BY s.created_at DESC
   `;
   db.query(sql, (err, results) => {
@@ -547,9 +1085,11 @@ app.get("/api/sales/:id", (req, res) => {
 
   const saleSql = `
     SELECT s.id, s.total, s.payment_method, s.customer_id, s.created_at,
-      c.name AS customer_name, c.phone AS customer_phone, c.email AS customer_email
+      c.name AS customer_name, c.phone AS customer_phone, c.email AS customer_email,
+      u.full_name AS cashier_name, u.role AS cashier_role
     FROM sales s
     LEFT JOIN customers c ON s.customer_id = c.id
+    LEFT JOIN users u ON s.user_id = u.id
     WHERE s.id = ?
   `;
   db.query(saleSql, [saleId], (err, saleRows) => {
@@ -699,65 +1239,90 @@ app.get('/api/customers/:id/sales', (req, res) => {
   });
 });
 
-// POST /api/customers - create
-app.post("/api/customers", (req, res) => {
-  const { name, phone, email, address, notes } = req.body;
+function sanitizeCustomerInput(input = {}) {
+  const name = typeof input.name === 'string' ? input.name.trim() : '';
+  const phone = typeof input.phone === 'string' ? input.phone.trim() : '';
+  const email = typeof input.email === 'string' ? input.email.trim() : '';
+  const address = typeof input.address === 'string' ? input.address.trim() : '';
+  const notes = typeof input.notes === 'string' ? input.notes.trim() : '';
 
-  if (!name || typeof name !== 'string' || name.trim() === '') {
-    return res.status(400).json({ error: "Customer name is required" });
+  if (!name) {
+    throw new Error('Customer name is required');
   }
 
-  const sql = `INSERT INTO customers (name, phone, email, address, notes) VALUES (?, ?, ?, ?, ?)`;
-  db.query(sql, [name.trim(), phone || null, email || null, address || null, notes || null], (err, result) => {
-    if (err) {
-      console.error("Error creating customer:", err.message);
-      return res.status(500).json({ error: "Failed to create customer" });
-    }
-    db.query("SELECT id, name, phone, email, address, notes, created_at FROM customers WHERE id = ?", [result.insertId], (err2, rows) => {
-      if (err2) {
-        console.error("Error fetching new customer:", err2.message);
-        return res.status(500).json({ error: "Customer created but failed to fetch" });
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    throw new Error('Please enter a valid email address');
+  }
+
+  return {
+    name,
+    phone: phone || null,
+    email: email || null,
+    address: address || null,
+    notes: notes || null,
+  };
+}
+
+// POST /api/customers - create
+app.post("/api/customers", (req, res) => {
+  try {
+    const payload = sanitizeCustomerInput(req.body);
+
+    const sql = `INSERT INTO customers (name, phone, email, address, notes) VALUES (?, ?, ?, ?, ?)`;
+    db.query(sql, [payload.name, payload.phone, payload.email, payload.address, payload.notes], (err, result) => {
+      if (err) {
+        console.error("Error creating customer:", err.message);
+        return res.status(500).json({ error: "Failed to create customer" });
       }
-      res.status(201).json(rows[0]);
+      db.query("SELECT id, name, phone, email, address, notes, created_at FROM customers WHERE id = ?", [result.insertId], (err2, rows) => {
+        if (err2) {
+          console.error("Error fetching new customer:", err2.message);
+          return res.status(500).json({ error: "Customer created but failed to fetch" });
+        }
+        res.status(201).json(rows[0]);
+      });
     });
-  });
+  } catch (error) {
+    return res.status(400).json({ error: error.message || "Invalid customer data" });
+  }
 });
 
 // PUT /api/customers/:id - update
 app.put("/api/customers/:id", (req, res) => {
   const customerId = Number(req.params.id);
-  const { name, phone, email, address, notes } = req.body;
 
   if (!Number.isInteger(customerId) || customerId <= 0) {
     return res.status(400).json({ error: "Invalid customer id" });
   }
 
-  if (!name || typeof name !== 'string' || name.trim() === '') {
-    return res.status(400).json({ error: "Customer name is required" });
-  }
+  try {
+    const payload = sanitizeCustomerInput(req.body);
 
-  db.query("SELECT id FROM customers WHERE id = ?", [customerId], (err, rows) => {
-    if (err) {
-      console.error("Error checking customer:", err.message);
-      return res.status(500).json({ error: "Failed to update customer" });
-    }
-    if (rows.length === 0) return res.status(404).json({ error: "Customer not found" });
-
-    const sql = `UPDATE customers SET name = ?, phone = ?, email = ?, address = ?, notes = ? WHERE id = ?`;
-    db.query(sql, [name.trim(), phone || null, email || null, address || null, notes || null, customerId], (err2) => {
-      if (err2) {
-        console.error("Error updating customer:", err2.message);
+    db.query("SELECT id FROM customers WHERE id = ?", [customerId], (err, rows) => {
+      if (err) {
+        console.error("Error checking customer:", err.message);
         return res.status(500).json({ error: "Failed to update customer" });
       }
-      db.query("SELECT id, name, phone, email, address, notes, created_at FROM customers WHERE id = ?", [customerId], (err3, updated) => {
-        if (err3) {
-          console.error("Error fetching updated customer:", err3.message);
-          return res.status(500).json({ error: "Failed to fetch updated customer" });
+      if (rows.length === 0) return res.status(404).json({ error: "Customer not found" });
+
+      const sql = `UPDATE customers SET name = ?, phone = ?, email = ?, address = ?, notes = ? WHERE id = ?`;
+      db.query(sql, [payload.name, payload.phone, payload.email, payload.address, payload.notes, customerId], (err2) => {
+        if (err2) {
+          console.error("Error updating customer:", err2.message);
+          return res.status(500).json({ error: "Failed to update customer" });
         }
-        res.json(updated[0]);
+        db.query("SELECT id, name, phone, email, address, notes, created_at FROM customers WHERE id = ?", [customerId], (err3, updated) => {
+          if (err3) {
+            console.error("Error fetching updated customer:", err3.message);
+            return res.status(500).json({ error: "Failed to fetch updated customer" });
+          }
+          res.json(updated[0]);
+        });
       });
     });
-  });
+  } catch (error) {
+    return res.status(400).json({ error: error.message || "Invalid customer data" });
+  }
 });
 
 // DELETE /api/customers/:id
@@ -768,13 +1333,26 @@ app.delete("/api/customers/:id", (req, res) => {
     return res.status(400).json({ error: "Invalid customer id" });
   }
 
-  db.query("DELETE FROM customers WHERE id = ?", [customerId], (err, result) => {
-    if (err) {
-      console.error("Error deleting customer:", err.message);
-      return res.status(500).json({ error: "Failed to delete customer" });
+  db.query("SELECT id FROM sales WHERE customer_id = ? LIMIT 1", [customerId], (saleErr, saleRows) => {
+    if (saleErr) {
+      console.error("Error checking customer sales:", saleErr.message);
+      return res.status(500).json({ error: "Failed to check customer sales" });
     }
-    if (result.affectedRows === 0) return res.status(404).json({ error: "Customer not found" });
-    res.json({ success: true });
+
+    if (saleRows.length > 0) {
+      return res.status(409).json({
+        error: "This customer has sales history and cannot be deleted. Historical sales are preserved to keep the record accurate."
+      });
+    }
+
+    db.query("DELETE FROM customers WHERE id = ?", [customerId], (err, result) => {
+      if (err) {
+        console.error("Error deleting customer:", err.message);
+        return res.status(500).json({ error: "Failed to delete customer" });
+      }
+      if (result.affectedRows === 0) return res.status(404).json({ error: "Customer not found" });
+      res.json({ success: true });
+    });
   });
 });
 
@@ -992,7 +1570,7 @@ app.get("/api/reports/top-products", (req, res) => {
       FROM sale_items si
       JOIN products p ON p.id = si.product_id
       JOIN sales s ON s.id = si.sale_id
-      ${whereClause.replace('created_at', 's.created_at')}
+      ${whereClause}
       GROUP BY p.id, p.name
       ORDER BY quantitySold DESC, revenue DESC
       LIMIT 10
